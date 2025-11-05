@@ -750,6 +750,66 @@ async function gerarPlanilhaExcel(producaoData, dataAnterior) {
 }
 
 /**
+ * Função centralizada para enviar e-mail de erro/notificação
+ */
+async function enviarEmailErro(titulo, mensagem, erro, contexto = {}) {
+  try {
+    const email = process.env.MAIL_EMAIL;
+    const password = process.env.MAIL_PASSWORD;
+    const emailDestinatario = process.env.DIRETOR_EMAIL || email;
+
+    if (!email || !password) {
+      console.error("⚠️ Não foi possível enviar e-mail de erro: MAIL_EMAIL ou MAIL_PASSWORD não configurados");
+      return;
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: "smtp.dreamhost.com",
+      port: 587,
+      secure: false,
+      auth: { user: email, pass: password },
+      tls: { rejectUnauthorized: false },
+    });
+
+    const erroDetalhado = erro 
+      ? `\n\n<strong>Erro:</strong>\n<pre style="white-space: pre-wrap; background: #f5f5f5; padding: 10px; border-radius: 4px;">${String(erro)}</pre>\n\n<strong>Stack Trace:</strong>\n<pre style="white-space: pre-wrap; background: #f5f5f5; padding: 10px; border-radius: 4px;">${erro.stack || 'N/A'}</pre>`
+      : '';
+
+    const contextoHtml = Object.keys(contexto).length > 0
+      ? `\n\n<strong>Contexto:</strong>\n<ul>${Object.entries(contexto).map(([k, v]) => `<li><strong>${k}:</strong> ${v}</li>`).join('')}</ul>`
+      : '';
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"></head>
+      <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
+        <div style="max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <h1 style="color: #d32f2f; margin-top: 0;">⚠️ ${titulo}</h1>
+          <p style="font-size: 16px; line-height: 1.6;">${mensagem}</p>
+          <p style="color: #666; font-size: 14px;"><strong>Data/Hora:</strong> ${new Date().toLocaleString("pt-BR")}</p>
+          ${erroDetalhado}
+          ${contextoHtml}
+        </div>
+      </body>
+      </html>
+    `;
+
+    await transporter.sendMail({
+      from: `"Sistema de Relatórios - Avantar" <${email}>`,
+      to: emailDestinatario,
+      subject: `🚨 ${titulo} - ${new Date().toLocaleDateString("pt-BR")}`,
+      html,
+    });
+
+    console.log(`✅ E-mail de erro enviado para: ${emailDestinatario}`);
+  } catch (emailErr) {
+    console.error("❌ Erro crítico: Não foi possível enviar e-mail de notificação de erro:", emailErr);
+    console.error("Erro original que deveria ser notificado:", erro);
+  }
+}
+
+/**
  * Envia relatório por e-mail
  */
 async function enviarEmail(
@@ -1003,7 +1063,7 @@ async function enviarEmail(
 let whatsappClient = null;
 
 async function inicializarWhatsApp() {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     if (whatsappClient && whatsappClient.info) {
       // Cliente já está pronto
       resolve(whatsappClient);
@@ -1018,6 +1078,23 @@ async function inicializarWhatsApp() {
       });
       return;
     }
+
+    let isResolved = false;
+
+    // Timeout de segurança: se não conectar em 5 minutos, rejeita
+    const timeout = setTimeout(async () => {
+      if (!isResolved) {
+        isResolved = true;
+        const erro = new Error("Timeout: WhatsApp não conectou em 5 minutos");
+        console.error(erro.message);
+        await enviarEmailErro(
+          "Timeout na Inicialização do WhatsApp",
+          "O WhatsApp não conseguiu conectar em 5 minutos. Isso pode indicar problema de conexão ou necessidade de escanear QR Code novamente.",
+          erro
+        );
+        reject(erro);
+      }
+    }, 5 * 60 * 1000); // 5 minutos
 
     whatsappClient = new Client({
       authStrategy: new LocalAuth({
@@ -1037,8 +1114,6 @@ async function inicializarWhatsApp() {
       },
     });
 
-    let isResolved = false;
-
     whatsappClient.on("qr", (qr) => {
       console.log("QR Code gerado para WhatsApp. Escaneie com o WhatsApp:");
       qrcode.generate(qr, { small: true });
@@ -1048,6 +1123,7 @@ async function inicializarWhatsApp() {
       console.log("WhatsApp conectado!");
       if (!isResolved) {
         isResolved = true;
+        clearTimeout(timeout); // Limpa o timeout
         // Aguardar um pouco mais para garantir que tudo está carregado
         setTimeout(() => {
           resolve(whatsappClient);
@@ -1059,20 +1135,47 @@ async function inicializarWhatsApp() {
       console.log("WhatsApp autenticado!");
     });
 
-    whatsappClient.on("auth_failure", (msg) => {
+    whatsappClient.on("auth_failure", async (msg) => {
       console.error("Falha na autenticação do WhatsApp:", msg);
-      isResolved = true;
-      reject(new Error("Falha na autenticação do WhatsApp"));
+      if (!isResolved) {
+        isResolved = true;
+        clearTimeout(timeout); // Limpa o timeout
+        const erro = new Error("Falha na autenticação do WhatsApp");
+        // Notificar por e-mail sobre falha de autenticação
+        await enviarEmailErro(
+          "Falha na Autenticação do WhatsApp",
+          "O sistema não conseguiu autenticar no WhatsApp. É necessário escanear o QR Code novamente.",
+          erro,
+          { motivo: msg || "Desconhecido" }
+        );
+        reject(erro);
+      }
     });
 
-    whatsappClient.on("disconnected", (reason) => {
+    whatsappClient.on("disconnected", async (reason) => {
       console.log("WhatsApp desconectado:", reason);
+      // Notificar desconexão apenas se não foi intencional
+      if (reason !== "LOGOUT" && reason !== "NAVIGATION") {
+        await enviarEmailErro(
+          "WhatsApp Desconectado",
+          "O WhatsApp foi desconectado inesperadamente.",
+          null,
+          { motivo: reason || "Desconhecido" }
+        );
+      }
       whatsappClient = null;
     });
 
-    whatsappClient.initialize().catch((err) => {
+    whatsappClient.initialize().catch(async (err) => {
       if (!isResolved) {
         isResolved = true;
+        clearTimeout(timeout); // Limpa o timeout
+        // Notificar erro na inicialização
+        await enviarEmailErro(
+          "Erro ao Inicializar WhatsApp",
+          "Ocorreu um erro ao tentar inicializar o cliente WhatsApp.",
+          err
+        );
         reject(err);
       }
     });
@@ -1221,6 +1324,18 @@ async function enviarWhatsApp(
   } catch (err) {
     console.error("Erro ao enviar WhatsApp:", err);
     console.error("Stack trace:", err.stack);
+    
+    // Notificar erro por e-mail
+    await enviarEmailErro(
+      "Erro ao Enviar WhatsApp - Relatório Diário",
+      "Ocorreu um erro ao tentar enviar o relatório diário via WhatsApp. O relatório foi gerado e enviado por e-mail, mas falhou no envio via WhatsApp.",
+      err,
+      {
+        data: dataAnterior,
+        tipo: "Relatório Diário"
+      }
+    );
+    
     // Não lançar erro para não interromper o processo
   } finally {
     // Aguardar um tempo adicional antes de desconectar para garantir que os envios foram concluídos
@@ -1306,14 +1421,28 @@ async function gerarRelatorioDiario(encerrarProcesso = true) {
 
     // Enviar por e-mail
     console.log("Enviando por e-mail...");
-    await enviarEmail(
-      transmissoes,
-      apolicesEmitidas,
-      sinistros,
-      assistenciasUrgentes,
-      arquivoExcel,
-      dataAnterior
-    );
+    try {
+      await enviarEmail(
+        transmissoes,
+        apolicesEmitidas,
+        sinistros,
+        assistenciasUrgentes,
+        arquivoExcel,
+        dataAnterior
+      );
+    } catch (emailErr) {
+      console.error("Erro ao enviar e-mail:", emailErr);
+      await enviarEmailErro(
+        "Erro ao Enviar E-mail - Relatório Diário",
+        "Ocorreu um erro ao tentar enviar o relatório diário por e-mail. O relatório foi gerado, mas não foi enviado.",
+        emailErr,
+        {
+          data: dataAnterior,
+          tipo: "Relatório Diário"
+        }
+      );
+      // Continua o processo mesmo se o e-mail falhar
+    }
 
     // Enviar por WhatsApp
     console.log("Enviando por WhatsApp...");
@@ -1337,37 +1466,18 @@ async function gerarRelatorioDiario(encerrarProcesso = true) {
     console.log("Relatório enviado com sucesso!");
   } catch (err) {
     console.error("Erro ao gerar relatório:", err);
+    console.error("Stack trace:", err.stack);
 
-    // Enviar e-mail de erro
-    try {
-      const email = process.env.MAIL_EMAIL;
-      const password = process.env.MAIL_PASSWORD;
-
-      const transporter = nodemailer.createTransport({
-        host: "smtp.dreamhost.com",
-        port: 587,
-        auth: {
-          user: email,
-          pass: password,
-        },
-      });
-
-      await transporter.sendMail({
-        from: email,
-        to: email,
-        subject: "Erro ao gerar relatório diário",
-        html: `
-          <h1 style="color: red">Erro ao gerar relatório diário</h1>
-          <p><strong>Data/Hora:</strong> ${new Date().toLocaleString(
-            "pt-BR"
-          )}</p>
-          <h2>Erro:</h2>
-          <pre style="white-space: pre-wrap;">${String(err)}</pre>
-        `,
-      });
-    } catch (emailErr) {
-      console.error("Erro ao enviar e-mail de erro:", emailErr);
-    }
+    // Enviar e-mail de erro usando função centralizada
+    await enviarEmailErro(
+      "Erro ao Gerar Relatório Diário",
+      "Ocorreu um erro crítico ao tentar gerar ou enviar o relatório diário. O processo foi interrompido.",
+      err,
+      {
+        tipo: "Relatório Diário",
+        data: dataAnterior
+      }
+    );
 
     throw err;
   } finally {
@@ -1453,15 +1563,29 @@ async function gerarRelatorioSemanal(encerrarProcesso = true) {
 
     // Enviar por e-mail (adaptando a função existente)
     console.log("Enviando relatório semanal por e-mail...");
-    await enviarEmailSemanal(
-      transmissoesTotais,
-      apolicesEmitidasTotais,
-      sinistrosTotais,
-      assistenciasUrgentesTotais,
-      arquivoExcel,
-      dataInicial,
-      dataFinal
-    );
+    try {
+      await enviarEmailSemanal(
+        transmissoesTotais,
+        apolicesEmitidasTotais,
+        sinistrosTotais,
+        assistenciasUrgentesTotais,
+        arquivoExcel,
+        dataInicial,
+        dataFinal
+      );
+    } catch (emailErr) {
+      console.error("Erro ao enviar e-mail semanal:", emailErr);
+      await enviarEmailErro(
+        "Erro ao Enviar E-mail - Relatório Semanal",
+        "Ocorreu um erro ao tentar enviar o relatório semanal por e-mail. O relatório foi gerado, mas não foi enviado.",
+        emailErr,
+        {
+          periodo: `${dataInicial} até ${dataFinal}`,
+          tipo: "Relatório Semanal"
+        }
+      );
+      // Continua o processo mesmo se o e-mail falhar
+    }
 
     // Enviar por WhatsApp
     console.log("Enviando relatório semanal por WhatsApp...");
@@ -1487,6 +1611,18 @@ async function gerarRelatorioSemanal(encerrarProcesso = true) {
   } catch (err) {
     console.error("Erro ao gerar relatório semanal:", err);
     console.error("Stack trace:", err.stack);
+
+    // Enviar e-mail de erro usando função centralizada
+    await enviarEmailErro(
+      "Erro ao Gerar Relatório Semanal",
+      "Ocorreu um erro crítico ao tentar gerar ou enviar o relatório semanal. O processo foi interrompido.",
+      err,
+      {
+        tipo: "Relatório Semanal",
+        periodo: `${dataInicial} até ${dataFinal}`
+      }
+    );
+
     throw err;
   } finally {
     // Garantir que o processo termine após a execução (apenas se solicitado)
@@ -1570,14 +1706,28 @@ async function gerarRelatorioMensal(encerrarProcesso = true) {
 
     // Enviar por e-mail
     console.log("Enviando relatório mensal por e-mail...");
-    await enviarEmailMensal(
-      transmissoesTotais,
-      apolicesEmitidasTotais,
-      sinistrosTotais,
-      assistenciasUrgentesTotais,
-      arquivoExcel,
-      mesNome
-    );
+    try {
+      await enviarEmailMensal(
+        transmissoesTotais,
+        apolicesEmitidasTotais,
+        sinistrosTotais,
+        assistenciasUrgentesTotais,
+        arquivoExcel,
+        mesNome
+      );
+    } catch (emailErr) {
+      console.error("Erro ao enviar e-mail mensal:", emailErr);
+      await enviarEmailErro(
+        "Erro ao Enviar E-mail - Relatório Mensal",
+        "Ocorreu um erro ao tentar enviar o relatório mensal por e-mail. O relatório foi gerado, mas não foi enviado.",
+        emailErr,
+        {
+          periodo: mesNome,
+          tipo: "Relatório Mensal"
+        }
+      );
+      // Continua o processo mesmo se o e-mail falhar
+    }
 
     // Enviar por WhatsApp
     console.log("Enviando relatório mensal por WhatsApp...");
@@ -1602,6 +1752,18 @@ async function gerarRelatorioMensal(encerrarProcesso = true) {
   } catch (err) {
     console.error("Erro ao gerar relatório mensal:", err);
     console.error("Stack trace:", err.stack);
+
+    // Enviar e-mail de erro usando função centralizada
+    await enviarEmailErro(
+      "Erro ao Gerar Relatório Mensal",
+      "Ocorreu um erro crítico ao tentar gerar ou enviar o relatório mensal. O processo foi interrompido.",
+      err,
+      {
+        tipo: "Relatório Mensal",
+        periodo: mesNome
+      }
+    );
+
     throw err;
   } finally {
     // Garantir que o processo termine após a execução (apenas se solicitado)
@@ -1787,11 +1949,27 @@ async function enviarWhatsAppSemanal(transmissoes, apolices, sinistros, assisten
     await delay(3000);
   } catch (err) {
     console.error("Erro ao enviar WhatsApp semanal:", err);
+    console.error("Stack trace:", err.stack);
+    
+    // Notificar erro por e-mail
+    await enviarEmailErro(
+      "Erro ao Enviar WhatsApp - Relatório Semanal",
+      "Ocorreu um erro ao tentar enviar o relatório semanal via WhatsApp. O relatório foi gerado e enviado por e-mail, mas falhou no envio via WhatsApp.",
+      err,
+      {
+        periodo: `${dataInicio} até ${dataFim}`,
+        tipo: "Relatório Semanal"
+      }
+    );
   } finally {
     if (whatsappClient) {
-      await delay(5000);
-      await whatsappClient.destroy();
-      whatsappClient = null;
+      try {
+        await delay(5000);
+        await whatsappClient.destroy();
+        whatsappClient = null;
+      } catch (destroyErr) {
+        console.warn("Erro ao desconectar cliente WhatsApp:", destroyErr.message);
+      }
     }
   }
 }
@@ -1837,21 +2015,91 @@ async function enviarWhatsAppMensal(transmissoes, apolices, sinistros, assistenc
     await delay(3000);
   } catch (err) {
     console.error("Erro ao enviar WhatsApp mensal:", err);
+    console.error("Stack trace:", err.stack);
+    
+    // Notificar erro por e-mail
+    await enviarEmailErro(
+      "Erro ao Enviar WhatsApp - Relatório Mensal",
+      "Ocorreu um erro ao tentar enviar o relatório mensal via WhatsApp. O relatório foi gerado e enviado por e-mail, mas falhou no envio via WhatsApp.",
+      err,
+      {
+        periodo: mesNome,
+        tipo: "Relatório Mensal"
+      }
+    );
   } finally {
     if (whatsappClient) {
-      await delay(5000);
-      await whatsappClient.destroy();
-      whatsappClient = null;
+      try {
+        await delay(5000);
+        await whatsappClient.destroy();
+        whatsappClient = null;
+      } catch (destroyErr) {
+        console.warn("Erro ao desconectar cliente WhatsApp:", destroyErr.message);
+      }
     }
   }
 }
 
 
+// ===== HANDLERS GLOBAIS DE ERRO =====
+// Captura erros não tratados
+process.on("uncaughtException", async (err) => {
+  console.error("❌ ERRO NÃO TRATADO (uncaughtException):", err);
+  console.error("Stack trace:", err.stack);
+  
+  // Tentar notificar por e-mail
+  try {
+    await enviarEmailErro(
+      "Erro Crítico Não Tratado - Sistema de Relatórios",
+      "Ocorreu um erro crítico não tratado que pode ter interrompido o sistema de relatórios.",
+      err,
+      {
+        tipo: "uncaughtException",
+        timestamp: new Date().toISOString()
+      }
+    );
+  } catch (emailErr) {
+    console.error("❌ Falha ao enviar e-mail de erro crítico:", emailErr);
+  }
+  
+  // Dar tempo para o e-mail ser enviado antes de encerrar
+  setTimeout(() => {
+    process.exit(1);
+  }, 5000);
+});
+
+// Captura promises rejeitadas não tratadas
+process.on("unhandledRejection", async (reason, promise) => {
+  console.error("❌ PROMISE REJEITADA NÃO TRATADA:", reason);
+  console.error("Promise:", promise);
+  
+  // Tentar notificar por e-mail
+  try {
+    const erro = reason instanceof Error ? reason : new Error(String(reason));
+    await enviarEmailErro(
+      "Promise Rejeitada Não Tratada - Sistema de Relatórios",
+      "Uma promise foi rejeitada e não foi tratada adequadamente. Isso pode indicar um problema no código assíncrono.",
+      erro,
+      {
+        tipo: "unhandledRejection",
+        timestamp: new Date().toISOString()
+      }
+    );
+  } catch (emailErr) {
+    console.error("❌ Falha ao enviar e-mail de erro crítico:", emailErr);
+  }
+});
+
 // Agendar execução diária às 6h (terça a sábado - dias úteis)
 console.log("Agendando relatório diário para 6h da manhã (terça a sábado)...");
 cron.schedule("0 6 * * 2-6", async () => {
-  console.log("Executando relatório diário agendado...");
-  await gerarRelatorioDiario();
+  try {
+    console.log("Executando relatório diário agendado...");
+    await gerarRelatorioDiario();
+  } catch (err) {
+    console.error("Erro não tratado no relatório diário agendado:", err);
+    // O erro já foi notificado dentro da função gerarRelatorioDiario
+  }
 }, {
   timezone: "America/Sao_Paulo"
 });
@@ -1859,8 +2107,13 @@ cron.schedule("0 6 * * 2-6", async () => {
 // Agendar execução semanal aos sábados às 6h15
 console.log("Agendando relatório semanal para sábados às 6h15...");
 cron.schedule("15 6 * * 6", async () => {
-  console.log("Executando relatório semanal agendado...");
-  await gerarRelatorioSemanal();
+  try {
+    console.log("Executando relatório semanal agendado...");
+    await gerarRelatorioSemanal();
+  } catch (err) {
+    console.error("Erro não tratado no relatório semanal agendado:", err);
+    // O erro já foi notificado dentro da função gerarRelatorioSemanal
+  }
 }, {
   timezone: "America/Sao_Paulo"
 }); 
@@ -1868,8 +2121,13 @@ cron.schedule("15 6 * * 6", async () => {
 // Agendar execução mensal no primeiro dia do mês às 6h00
 console.log("Agendando relatório mensal para o primeiro dia de cada mês às 6h00...");
 cron.schedule("0 6 1 * *", async () => {
-  console.log("Executando relatório mensal agendado...");
-  await gerarRelatorioMensal();
+  try {
+    console.log("Executando relatório mensal agendado...");
+    await gerarRelatorioMensal();
+  } catch (err) {
+    console.error("Erro não tratado no relatório mensal agendado:", err);
+    // O erro já foi notificado dentro da função gerarRelatorioMensal
+  }
 }, {
   timezone: "America/Sao_Paulo"
 });
