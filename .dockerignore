@@ -1,0 +1,12 @@
+# .dockerignore
+node_modules
+npm-debug.log
+Dockerfile
+.dockerignore
+.git
+.gitignore
+whatsapp-session/session/Default/Code Cache
+whatsapp-session/session/Default/Service Worker/CacheStorage
+whatsapp-session/session/Default/Service Worker/ScriptCache
+whatsapp-session/session/Default/DevToolsActivePort
+whatsapp-session/session/Default/Cache
