@@ -11,8 +11,31 @@ import qrcode from "qrcode-terminal";
 import fs from "fs";
 import path from "path";
 
+const WHATSAPP_SESSION_PATH = path.join(process.cwd(), "whatsapp-session");
+const WHATSAPP_QR_FILE = path.join(process.cwd(), "whatsapp-qr.txt");
+const WHATSAPP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutos
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function limparSessaoWhatsApp() {
+  try {
+    if (fs.existsSync(WHATSAPP_SESSION_PATH)) {
+      await fs.promises.rm(WHATSAPP_SESSION_PATH, {
+        recursive: true,
+        force: true,
+      });
+      console.log(
+        "Sessão local do WhatsApp removida. Um novo QR será gerado na próxima inicialização."
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "Não foi possível remover a sessão local do WhatsApp:",
+      err.message
+    );
+  }
 }
 
 /**
@@ -1039,12 +1062,6 @@ async function enviarEmail(
         fs.statSync(arquivoExcel.filePath).size
       } bytes)`
     );
-
-    // Adicionar informações sobre possíveis problemas
-    console.log("\n⚠️  Se o e-mail não chegou, verifique:");
-    console.log("  1. Pasta de SPAM/Lixo Eletrônico");
-    console.log("  2. Aguarde alguns minutos (pode estar na fila do servidor)");
-    console.log("  3. Verifique se o endereço de destino está correto");
   } catch (err) {
     console.error("Erro ao enviar e-mail:");
     console.error("Mensagem:", err.message);
@@ -1081,24 +1098,74 @@ async function inicializarWhatsApp() {
 
     let isResolved = false;
 
-    // Timeout de segurança: se não conectar em 5 minutos, rejeita
-    const timeout = setTimeout(async () => {
-      if (!isResolved) {
-        isResolved = true;
-        const erro = new Error("Timeout: WhatsApp não conectou em 5 minutos");
-        console.error(erro.message);
-        await enviarEmailErro(
-          "Timeout na Inicialização do WhatsApp",
-          "O WhatsApp não conseguiu conectar em 5 minutos. Isso pode indicar problema de conexão ou necessidade de escanear QR Code novamente.",
-          erro
-        );
-        reject(erro);
+    let postAuthTimeout = null;
+
+    const limparPostAuthTimeout = () => {
+      if (postAuthTimeout) {
+        clearTimeout(postAuthTimeout);
+        postAuthTimeout = null;
       }
-    }, 5 * 60 * 1000); // 5 minutos
+    };
+
+    const handleFailure = async (erro, { notificar = true } = {}) => {
+      if (isResolved) {
+        return;
+      }
+      isResolved = true;
+      clearTimeout(timeout);
+      limparPostAuthTimeout();
+      try {
+        if (notificar) {
+          await enviarEmailErro(
+            erro.titulo || "Erro ao Inicializar WhatsApp",
+            erro.mensagem ||
+              "Ocorreu um erro ao tentar inicializar o cliente WhatsApp.",
+            erro.original || erro,
+            erro.contexto
+          );
+        }
+      } catch (emailErr) {
+        console.warn(
+          "Falha ao enviar e-mail de erro do WhatsApp:",
+          emailErr.message
+        );
+      }
+      if (whatsappClient) {
+        try {
+          await whatsappClient.destroy();
+        } catch (destroyErr) {
+          console.warn(
+            "Não foi possível destruir o cliente WhatsApp:",
+            destroyErr.message
+          );
+        } finally {
+          whatsappClient = null;
+        }
+      }
+      await limparSessaoWhatsApp();
+      reject(erro.original || erro);
+    };
+
+    const handleTimeout = async () => {
+      const erro = new Error(
+        "Timeout: WhatsApp não conectou em tempo hábil. Sessão local será reiniciada."
+      );
+      erro.titulo = "Timeout na Inicialização do WhatsApp";
+      erro.mensagem =
+        "O WhatsApp não conseguiu conectar no tempo limite. A sessão local será limpa para forçar um novo QR Code na próxima tentativa.";
+      await handleFailure(erro, { notificar: true });
+    };
+
+    // Timeout de segurança
+    const timeout = setTimeout(() => {
+      handleTimeout().catch((err) => {
+        console.error("Erro ao tratar timeout do WhatsApp:", err.message);
+      });
+    }, WHATSAPP_TIMEOUT_MS);
 
     whatsappClient = new Client({
       authStrategy: new LocalAuth({
-        dataPath: "./whatsapp-session",
+        dataPath: WHATSAPP_SESSION_PATH,
       }),
       puppeteer: {
         headless: true,
@@ -1114,13 +1181,46 @@ async function inicializarWhatsApp() {
       },
     });
 
+    whatsappClient.on("loading_screen", (percent, message) => {
+      console.log(
+        `Carregando WhatsApp (${percent ?? "-"}%): ${message ?? ""}`.trim()
+      );
+    });
+
     whatsappClient.on("qr", (qr) => {
-      console.log("QR Code gerado para WhatsApp. Escaneie com o WhatsApp:");
-      qrcode.generate(qr, { small: true });
+      console.log(
+        "QR Code gerado para WhatsApp. Escaneie com o WhatsApp ou abra o arquivo whatsapp-qr.txt:"
+      );
+      const imprimirQr = (ascii) => {
+        console.log(ascii);
+        try {
+          fs.writeFileSync(WHATSAPP_QR_FILE, `${ascii}\n`);
+          console.log(
+            `QR Code salvo em ${WHATSAPP_QR_FILE}. Abra o arquivo caso o console não exiba corretamente.`
+          );
+        } catch (err) {
+          console.warn(
+            "Não foi possível salvar o QR Code no arquivo:",
+            err.message
+          );
+        }
+      };
+      qrcode.generate(qr, { small: true }, imprimirQr);
     });
 
     whatsappClient.on("ready", () => {
       console.log("WhatsApp conectado!");
+      limparPostAuthTimeout();
+      try {
+        if (fs.existsSync(WHATSAPP_QR_FILE)) {
+          fs.unlinkSync(WHATSAPP_QR_FILE);
+        }
+      } catch (err) {
+        console.warn(
+          "Não foi possível remover o arquivo de QR Code temporário:",
+          err.message
+        );
+      }
       if (!isResolved) {
         isResolved = true;
         clearTimeout(timeout); // Limpa o timeout
@@ -1133,23 +1233,31 @@ async function inicializarWhatsApp() {
 
     whatsappClient.on("authenticated", () => {
       console.log("WhatsApp autenticado!");
+      limparPostAuthTimeout();
+      postAuthTimeout = setTimeout(async () => {
+        if (whatsappClient && !isResolved) {
+          console.warn(
+            "WhatsApp autenticado, mas não ficou pronto em 60 segundos. Reiniciando sessão para forçar novo QR."
+          );
+          const erro = new Error(
+            "WhatsApp autenticado, porém não ficou pronto em tempo hábil."
+          );
+          erro.titulo = "WhatsApp Autenticado Sem Concluir Conexão";
+          erro.mensagem =
+            "O WhatsApp autenticou, mas não concluiu o carregamento (não disparou o evento 'ready'). A sessão será descartada para que um novo QR Code seja exibido na próxima tentativa.";
+          await handleFailure(erro, { notificar: true });
+        }
+      }, 60 * 1000);
     });
 
     whatsappClient.on("auth_failure", async (msg) => {
       console.error("Falha na autenticação do WhatsApp:", msg);
-      if (!isResolved) {
-        isResolved = true;
-        clearTimeout(timeout); // Limpa o timeout
-        const erro = new Error("Falha na autenticação do WhatsApp");
-        // Notificar por e-mail sobre falha de autenticação
-        await enviarEmailErro(
-          "Falha na Autenticação do WhatsApp",
-          "O sistema não conseguiu autenticar no WhatsApp. É necessário escanear o QR Code novamente.",
-          erro,
-          { motivo: msg || "Desconhecido" }
-        );
-        reject(erro);
-      }
+      const erro = new Error("Falha na autenticação do WhatsApp");
+      erro.titulo = "Falha na Autenticação do WhatsApp";
+      erro.mensagem =
+        "O sistema não conseguiu autenticar no WhatsApp. A sessão atual foi descartada para que um novo QR Code seja gerado.";
+      erro.contexto = { motivo: msg || "Desconhecido" };
+      await handleFailure(erro, { notificar: true });
     });
 
     whatsappClient.on("disconnected", async (reason) => {
@@ -1163,21 +1271,18 @@ async function inicializarWhatsApp() {
           { motivo: reason || "Desconhecido" }
         );
       }
+      if (reason === "LOGOUT" || reason === "AUTHENTICATED_WILL_RESTART") {
+        await limparSessaoWhatsApp();
+      }
       whatsappClient = null;
     });
 
     whatsappClient.initialize().catch(async (err) => {
-      if (!isResolved) {
-        isResolved = true;
-        clearTimeout(timeout); // Limpa o timeout
-        // Notificar erro na inicialização
-        await enviarEmailErro(
-          "Erro ao Inicializar WhatsApp",
-          "Ocorreu um erro ao tentar inicializar o cliente WhatsApp.",
-          err
-        );
-        reject(err);
-      }
+      const erro = err instanceof Error ? err : new Error(String(err));
+      erro.titulo = "Erro ao Inicializar WhatsApp";
+      erro.mensagem =
+        "Ocorreu um erro ao tentar inicializar o cliente WhatsApp. A sessão será reiniciada para permitir nova tentativa.";
+      await handleFailure(erro, { notificar: true });
     });
   });
 }
@@ -2090,6 +2195,7 @@ process.on("unhandledRejection", async (reason, promise) => {
   }
 });
 
+
 // Agendar execução diária às 6h (terça a sábado - dias úteis)
 console.log("Agendando relatório diário para 6h da manhã (terça a sábado)...");
 cron.schedule("0 6 * * 2-6", async () => {
@@ -2141,6 +2247,7 @@ console.log("===============================================\n");
 
 // Executar imediatamente se necessário (para testes)
 
+
 /*
 // Descomente as linhas abaixo para testar
 console.log("Executando relatórios imediatamente (modo teste)...");
@@ -2149,8 +2256,8 @@ console.log("Executando relatórios imediatamente (modo teste)...");
 (async () => {
   try {
     await gerarRelatorioDiario(false); // false = não encerra o processo
-    await gerarRelatorioSemanal(false); // false = não encerra o processo
-    await gerarRelatorioMensal(false); // false = não encerra o processo
+    //await gerarRelatorioSemanal(false); // false = não encerra o processo
+    //await gerarRelatorioMensal(false); // false = não encerra o processo
     console.log("\n✅ Todos os relatórios foram executados com sucesso!");
     console.log("Finalizando processo...");
     setTimeout(() => {
