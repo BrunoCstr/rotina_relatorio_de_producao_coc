@@ -5,37 +5,29 @@ import { formatDate } from "./utils/formatDate.js";
 import nodemailer from "nodemailer";
 import ExcelJS from "exceljs";
 import cron from "node-cron";
-import pkg from "whatsapp-web.js";
-const { Client, LocalAuth, MessageMedia } = pkg;
-import qrcode from "qrcode-terminal";
 import fs from "fs";
 import path from "path";
-
-const WHATSAPP_SESSION_PATH = path.join(process.cwd(), "whatsapp-session");
-const WHATSAPP_QR_FILE = path.join(process.cwd(), "whatsapp-qr.txt");
-const WHATSAPP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutos
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function limparSessaoWhatsApp() {
-  try {
-    if (fs.existsSync(WHATSAPP_SESSION_PATH)) {
-      await fs.promises.rm(WHATSAPP_SESSION_PATH, {
-        recursive: true,
-        force: true,
-      });
-      console.log(
-        "Sessão local do WhatsApp removida. Um novo QR será gerado na próxima inicialização."
-      );
-    }
-  } catch (err) {
-    console.warn(
-      "Não foi possível remover a sessão local do WhatsApp:",
-      err.message
-    );
+function formatarNumeroWhatsApp(numero) {
+  if (!numero) return null;
+  const digits = numero.replace(/\D/g, "");
+  if (!digits) return null;
+  return digits.startsWith("55") ? digits : `55${digits}`;
+}
+
+function obterNumeroWhatsApp() {
+  const numeroEnv = process.env.DIRETOR_WHATSAPP || null;
+  if (!numeroEnv) {
+    return { original: null, formatado: null };
   }
+  return {
+    original: numeroEnv,
+    formatado: formatarNumeroWhatsApp(numeroEnv),
+  };
 }
 
 /**
@@ -780,6 +772,7 @@ async function enviarEmailErro(titulo, mensagem, erro, contexto = {}) {
     const email = process.env.MAIL_EMAIL;
     const password = process.env.MAIL_PASSWORD;
     const emailDestinatario = process.env.DIRETOR_EMAIL || email;
+    const emailADM = process.env.EMAIL_ADM;
 
     if (!email || !password) {
       console.error("⚠️ Não foi possível enviar e-mail de erro: MAIL_EMAIL ou MAIL_PASSWORD não configurados");
@@ -820,7 +813,7 @@ async function enviarEmailErro(titulo, mensagem, erro, contexto = {}) {
 
     await transporter.sendMail({
       from: `"Sistema de Relatórios - Avantar" <${email}>`,
-      to: emailDestinatario,
+      to: emailADM,
       subject: `🚨 ${titulo} - ${new Date().toLocaleDateString("pt-BR")}`,
       html,
     });
@@ -1075,392 +1068,87 @@ async function enviarEmail(
   }
 }
 
-// Envia relatório por WhatsApp
+// Envia relatórios via Webhook
 
-let whatsappClient = null;
+async function enviarWebhookResumo(tipo, payload, contextoErro = {}) {
+  const webhookUrl = process.env.WEBHOOK_URL;
 
-async function inicializarWhatsApp() {
-  return new Promise(async (resolve, reject) => {
-    if (whatsappClient && whatsappClient.info) {
-      // Cliente já está pronto
-      resolve(whatsappClient);
-      return;
-    }
+  if (!webhookUrl) {
+    console.warn(
+      "WEBHOOK_URL não configurado. Pulando envio via webhook para o relatório."
+    );
+    return;
+  }
 
-    // Se o cliente existe mas não está pronto, aguardar
-    if (whatsappClient) {
-      whatsappClient.once("ready", () => {
-        console.log("WhatsApp conectado!");
-        resolve(whatsappClient);
-      });
-      return;
-    }
+  const body = {
+    tipo,
+    enviadoEm: new Date().toISOString().split("T")[0],
+    ...payload,
+  };
 
-    let isResolved = false;
+  try {
+    const payloadString = JSON.stringify(
+      body,
+      (_, value) => (typeof value === "bigint" ? value.toString() : value)
+    );
 
-    let postAuthTimeout = null;
-
-    const limparPostAuthTimeout = () => {
-      if (postAuthTimeout) {
-        clearTimeout(postAuthTimeout);
-        postAuthTimeout = null;
-      }
-    };
-
-    const handleFailure = async (erro, { notificar = true } = {}) => {
-      if (isResolved) {
-        return;
-      }
-      isResolved = true;
-      clearTimeout(timeout);
-      limparPostAuthTimeout();
-      try {
-        if (notificar) {
-          await enviarEmailErro(
-            erro.titulo || "Erro ao Inicializar WhatsApp",
-            erro.mensagem ||
-              "Ocorreu um erro ao tentar inicializar o cliente WhatsApp.",
-            erro.original || erro,
-            erro.contexto
-          );
-        }
-      } catch (emailErr) {
-        console.warn(
-          "Falha ao enviar e-mail de erro do WhatsApp:",
-          emailErr.message
-        );
-      }
-      if (whatsappClient) {
-        try {
-          await whatsappClient.destroy();
-        } catch (destroyErr) {
-          console.warn(
-            "Não foi possível destruir o cliente WhatsApp:",
-            destroyErr.message
-          );
-        } finally {
-          whatsappClient = null;
-        }
-      }
-      await limparSessaoWhatsApp();
-      reject(erro.original || erro);
-    };
-
-    const handleTimeout = async () => {
-      const erro = new Error(
-        "Timeout: WhatsApp não conectou em tempo hábil. Sessão local será reiniciada."
-      );
-      erro.titulo = "Timeout na Inicialização do WhatsApp";
-      erro.mensagem =
-        "O WhatsApp não conseguiu conectar no tempo limite. A sessão local será limpa para forçar um novo QR Code na próxima tentativa.";
-      await handleFailure(erro, { notificar: true });
-    };
-
-    // Timeout de segurança
-    const timeout = setTimeout(() => {
-      handleTimeout().catch((err) => {
-        console.error("Erro ao tratar timeout do WhatsApp:", err.message);
-      });
-    }, WHATSAPP_TIMEOUT_MS);
-
-    whatsappClient = new Client({
-      authStrategy: new LocalAuth({
-        dataPath: WHATSAPP_SESSION_PATH,
-      }),
-      puppeteer: {
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-accelerated-2d-canvas",
-          "--no-first-run",
-          "--no-zygote",
-          "--disable-gpu",
-        ],
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
       },
+      body: payloadString,
     });
 
-    whatsappClient.on("loading_screen", (percent, message) => {
-      console.log(
-        `Carregando WhatsApp (${percent ?? "-"}%): ${message ?? ""}`.trim()
+    if (!response.ok) {
+      const responseText = await response.text().catch(() => "");
+      throw new Error(
+        `Webhook respondeu com status ${response.status}: ${
+          responseText || response.statusText
+        }`
       );
-    });
+    }
 
-    whatsappClient.on("qr", (qr) => {
-      console.log(
-        "QR Code gerado para WhatsApp. Escaneie com o WhatsApp ou abra o arquivo whatsapp-qr.txt:"
-      );
-      const imprimirQr = (ascii) => {
-        console.log(ascii);
-        try {
-          fs.writeFileSync(WHATSAPP_QR_FILE, `${ascii}\n`);
-          console.log(
-            `QR Code salvo em ${WHATSAPP_QR_FILE}. Abra o arquivo caso o console não exiba corretamente.`
-          );
-        } catch (err) {
-          console.warn(
-            "Não foi possível salvar o QR Code no arquivo:",
-            err.message
-          );
-        }
-      };
-      qrcode.generate(qr, { small: true }, imprimirQr);
-    });
-
-    whatsappClient.on("ready", () => {
-      console.log("WhatsApp conectado!");
-      limparPostAuthTimeout();
-      try {
-        if (fs.existsSync(WHATSAPP_QR_FILE)) {
-          fs.unlinkSync(WHATSAPP_QR_FILE);
-        }
-      } catch (err) {
-        console.warn(
-          "Não foi possível remover o arquivo de QR Code temporário:",
-          err.message
-        );
-      }
-      if (!isResolved) {
-        isResolved = true;
-        clearTimeout(timeout); // Limpa o timeout
-        // Aguardar um pouco mais para garantir que tudo está carregado
-        setTimeout(() => {
-          resolve(whatsappClient);
-        }, 2000);
-      }
-    });
-
-    whatsappClient.on("authenticated", () => {
-      console.log("WhatsApp autenticado!");
-      limparPostAuthTimeout();
-      postAuthTimeout = setTimeout(async () => {
-        if (whatsappClient && !isResolved) {
-          console.warn(
-            "WhatsApp autenticado, mas não ficou pronto em 60 segundos. Reiniciando sessão para forçar novo QR."
-          );
-          const erro = new Error(
-            "WhatsApp autenticado, porém não ficou pronto em tempo hábil."
-          );
-          erro.titulo = "WhatsApp Autenticado Sem Concluir Conexão";
-          erro.mensagem =
-            "O WhatsApp autenticou, mas não concluiu o carregamento (não disparou o evento 'ready'). A sessão será descartada para que um novo QR Code seja exibido na próxima tentativa.";
-          await handleFailure(erro, { notificar: true });
-        }
-      }, 60 * 1000);
-    });
-
-    whatsappClient.on("auth_failure", async (msg) => {
-      console.error("Falha na autenticação do WhatsApp:", msg);
-      const erro = new Error("Falha na autenticação do WhatsApp");
-      erro.titulo = "Falha na Autenticação do WhatsApp";
-      erro.mensagem =
-        "O sistema não conseguiu autenticar no WhatsApp. A sessão atual foi descartada para que um novo QR Code seja gerado.";
-      erro.contexto = { motivo: msg || "Desconhecido" };
-      await handleFailure(erro, { notificar: true });
-    });
-
-    whatsappClient.on("disconnected", async (reason) => {
-      console.log("WhatsApp desconectado:", reason);
-      // Notificar desconexão apenas se não foi intencional
-      if (reason !== "LOGOUT" && reason !== "NAVIGATION") {
-        await enviarEmailErro(
-          "WhatsApp Desconectado",
-          "O WhatsApp foi desconectado inesperadamente.",
-          null,
-          { motivo: reason || "Desconhecido" }
-        );
-      }
-      if (reason === "LOGOUT" || reason === "AUTHENTICATED_WILL_RESTART") {
-        await limparSessaoWhatsApp();
-      }
-      whatsappClient = null;
-    });
-
-    whatsappClient.initialize().catch(async (err) => {
-      const erro = err instanceof Error ? err : new Error(String(err));
-      erro.titulo = "Erro ao Inicializar WhatsApp";
-      erro.mensagem =
-        "Ocorreu um erro ao tentar inicializar o cliente WhatsApp. A sessão será reiniciada para permitir nova tentativa.";
-      await handleFailure(erro, { notificar: true });
-    });
-  });
+    console.log(`Webhook (${tipo}) enviado com sucesso!`);
+  } catch (err) {
+    console.error(`Erro ao enviar webhook (${tipo}):`, err);
+    await enviarEmailErro(
+      `Erro ao Enviar Webhook - Relatório ${tipo}`,
+      `Ocorreu um erro ao tentar enviar o relatório ${tipo.toLowerCase()} via webhook. O relatório foi gerado, mas não foi enviado pelo webhook.`,
+      err,
+      contextoErro
+    );
+  }
 }
 
-async function enviarWhatsApp(
+async function enviarWebhookDiario(
   transmissoes,
   apolicesEmitidas,
   sinistros,
   assistenciasUrgentes,
-  arquivoExcel,
   dataAnterior
 ) {
-  try {
-    const numeroDestinatario = process.env.DIRETOR_WHATSAPP;
+  const numeroWhatsApp = obterNumeroWhatsApp();
 
-    if (!numeroDestinatario) {
-      console.log(
-        "Número de WhatsApp do diretor não configurado. Pulando envio por WhatsApp."
-      );
-      return;
+  await enviarWebhookResumo(
+    "Diário",
+    {
+      dataReferencia: {
+        inicio: dataAnterior,
+        fim: dataAnterior,
+      },
+      nome_da_data_de_referencia: "",
+      quantidadeTransmissoes: transmissoes.length,
+      quantidadeEmissoes: apolicesEmitidas.length,
+      quantidadeSinistrosAbertos: sinistros.length,
+      quantidadeAssistenciasUrgentes: assistenciasUrgentes.length,
+      numeroWhatsApp,
+    },
+    {
+      tipo: "Relatório Diário",
+      data: dataAnterior,
     }
-
-    console.log("Inicializando cliente WhatsApp...");
-    const client = await inicializarWhatsApp();
-
-    // Aguardar um pouco mais para garantir que o cliente está totalmente pronto
-    await delay(3000);
-
-    // Verificar se o cliente está realmente pronto
-    if (!client.info) {
-      console.warn(
-        "Cliente WhatsApp pode não estar totalmente pronto. Aguardando mais..."
-      );
-      await delay(5000);
-    }
-
-    // Formatar número (remover caracteres não numéricos e adicionar código do país se necessário)
-    let numeroFormatado = numeroDestinatario.replace(/\D/g, "");
-    if (!numeroFormatado.startsWith("55")) {
-      numeroFormatado = "55" + numeroFormatado;
-    }
-    numeroFormatado = numeroFormatado + "@c.us";
-
-    console.log(`Enviando mensagem para ${numeroFormatado}...`);
-
-    const mensagem = `
-📊 *Relatório Diário - Centro de Operações*
-
-📅 *Data de Referência:* ${dataAnterior}
-
-📈 *Resumo do Dia Anterior:*
-• Transmissões: *${transmissoes.length}*
-• Apólices Emitidas: *${apolicesEmitidas.length}*
-• Sinistros Abertos: *${sinistros.length}*
-• Assistências Urgentes: *${assistenciasUrgentes.length}*
-
-📎 Planilha completa em anexo.
-    `.trim();
-
-    // Função para enviar mensagem com retry
-    async function enviarComRetry(fn, tentativas = 3) {
-      for (let i = 0; i < tentativas; i++) {
-        try {
-          return await fn();
-        } catch (err) {
-          console.warn(`Tentativa ${i + 1} falhou:`, err.message);
-          if (i < tentativas - 1) {
-            await delay(2000 * (i + 1)); // Delay progressivo
-          } else {
-            throw err;
-          }
-        }
-      }
-    }
-
-    // Enviar mensagem com retry
-    await enviarComRetry(async () => {
-      await client.sendMessage(numeroFormatado, mensagem);
-    });
-
-    console.log("Mensagem de texto enviada com sucesso!");
-
-    // Aguardar um pouco antes de enviar o arquivo
-    await delay(2000);
-
-    // Verificar se o arquivo existe antes de enviar
-    if (!fs.existsSync(arquivoExcel.filePath)) {
-      throw new Error(`Arquivo Excel não encontrado: ${arquivoExcel.filePath}`);
-    }
-
-    // Obter informações do arquivo
-    const fileStats = fs.statSync(arquivoExcel.filePath);
-    const fileSizeInMB = (fileStats.size / (1024 * 1024)).toFixed(2);
-    console.log(
-      `Preparando arquivo para envio: ${arquivoExcel.fileName} (${fileSizeInMB} MB)`
-    );
-
-    // Verificar se o arquivo não é muito grande (limite do WhatsApp é ~64MB, mas recomendamos menos)
-    if (fileStats.size > 64 * 1024 * 1024) {
-      console.warn(
-        `Aviso: Arquivo muito grande (${fileSizeInMB} MB). Pode falhar no envio.`
-      );
-    }
-
-    // Ler arquivo e criar MessageMedia
-    const fileBuffer = fs.readFileSync(arquivoExcel.filePath);
-    const base64File = fileBuffer.toString("base64");
-
-    console.log(
-      `Arquivo convertido para base64 (${(base64File.length / 1024).toFixed(
-        2
-      )} KB)`
-    );
-
-    const media = new MessageMedia(
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      base64File,
-      arquivoExcel.fileName
-    );
-
-    console.log("MessageMedia criado com sucesso. Enviando arquivo...");
-
-    // Enviar arquivo Excel com retry
-    let arquivoEnviado = false;
-    await enviarComRetry(async () => {
-      const resultado = await client.sendMessage(numeroFormatado, media, {
-        caption: arquivoExcel.fileName,
-      });
-      arquivoEnviado = true;
-      return resultado;
-    });
-
-    if (arquivoEnviado) {
-      console.log("Arquivo Excel enviado com sucesso!");
-      // Aguardar um pouco mais para garantir que o arquivo foi processado pelo WhatsApp
-      await delay(3000);
-    } else {
-      console.warn(
-        "Aviso: Não foi possível confirmar o envio do arquivo Excel"
-      );
-    }
-
-    console.log("WhatsApp enviado com sucesso!");
-  } catch (err) {
-    console.error("Erro ao enviar WhatsApp:", err);
-    console.error("Stack trace:", err.stack);
-    
-    // Notificar erro por e-mail
-    await enviarEmailErro(
-      "Erro ao Enviar WhatsApp - Relatório Diário",
-      "Ocorreu um erro ao tentar enviar o relatório diário via WhatsApp. O relatório foi gerado e enviado por e-mail, mas falhou no envio via WhatsApp.",
-      err,
-      {
-        data: dataAnterior,
-        tipo: "Relatório Diário"
-      }
-    );
-    
-    // Não lançar erro para não interromper o processo
-  } finally {
-    // Aguardar um tempo adicional antes de desconectar para garantir que os envios foram concluídos
-    console.log("Aguardando processamento final antes de desconectar...");
-    await delay(5000);
-
-    // Desconectar o cliente WhatsApp após o envio para permitir que o processo termine
-    if (whatsappClient) {
-      try {
-        await whatsappClient.destroy();
-        whatsappClient = null;
-        console.log("Cliente WhatsApp desconectado.");
-      } catch (destroyErr) {
-        console.warn(
-          "Erro ao desconectar cliente WhatsApp:",
-          destroyErr.message
-        );
-      }
-    }
-  }
+  );
 }
 
 /**
@@ -1549,14 +1237,13 @@ async function gerarRelatorioDiario(encerrarProcesso = true) {
       // Continua o processo mesmo se o e-mail falhar
     }
 
-    // Enviar por WhatsApp
-    console.log("Enviando por WhatsApp...");
-    await enviarWhatsApp(
+    // Enviar via webhook
+    console.log("Enviando via webhook...");
+    await enviarWebhookDiario(
       transmissoes,
       apolicesEmitidas,
       sinistros,
       assistenciasUrgentes,
-      arquivoExcel,
       dataAnterior
     );
 
@@ -1692,14 +1379,13 @@ async function gerarRelatorioSemanal(encerrarProcesso = true) {
       // Continua o processo mesmo se o e-mail falhar
     }
 
-    // Enviar por WhatsApp
-    console.log("Enviando relatório semanal por WhatsApp...");
-    await enviarWhatsAppSemanal(
+    // Enviar via webhook
+    console.log("Enviando relatório semanal via webhook...");
+    await enviarWebhookSemanal(
       transmissoesTotais,
       apolicesEmitidasTotais,
       sinistrosTotais,
       assistenciasUrgentesTotais,
-      arquivoExcel,
       dataInicial,
       dataFinal
     );
@@ -1834,14 +1520,15 @@ async function gerarRelatorioMensal(encerrarProcesso = true) {
       // Continua o processo mesmo se o e-mail falhar
     }
 
-    // Enviar por WhatsApp
-    console.log("Enviando relatório mensal por WhatsApp...");
-    await enviarWhatsAppMensal(
+    // Enviar via webhook
+    console.log("Enviando relatório mensal via webhook...");
+    await enviarWebhookMensal(
       transmissoesTotais,
       apolicesEmitidasTotais,
       sinistrosTotais,
       assistenciasUrgentesTotais,
-      arquivoExcel,
+      inicio,
+      fim,
       mesNome
     );
 
@@ -2013,136 +1700,68 @@ async function enviarEmailMensal(transmissoes, apolices, sinistros, assistencias
   console.log("E-mail mensal enviado com sucesso!");
 }
 
-async function enviarWhatsAppSemanal(transmissoes, apolices, sinistros, assistencias, arquivo, dataInicio, dataFim) {
-  try {
-    const numeroDestinatario = process.env.DIRETOR_WHATSAPP;
-    if (!numeroDestinatario) return;
+async function enviarWebhookSemanal(
+  transmissoes,
+  apolices,
+  sinistros,
+  assistencias,
+  dataInicio,
+  dataFim
+) {
+  const numeroWhatsApp = obterNumeroWhatsApp();
 
-    const client = await inicializarWhatsApp();
-    await delay(3000);
-
-    let numeroFormatado = numeroDestinatario.replace(/\D/g, "");
-    if (!numeroFormatado.startsWith("55")) numeroFormatado = "55" + numeroFormatado;
-    numeroFormatado = numeroFormatado + "@c.us";
-
-    const mensagem = `📊 *Relatório Semanal - Centro de Operações*
-
-📅 *Período:* ${dataInicio} até ${dataFim}
-
-📈 *Resumo da Semana:*
-• Transmissões: *${transmissoes.length}*
-• Apólices Emitidas: *${apolices.length}*
-• Sinistros Abertos: *${sinistros.length}*
-• Assistências Urgentes: *${assistencias.length}*
-
-📎 Planilha completa em anexo.`.trim();
-
-    await client.sendMessage(numeroFormatado, mensagem);
-    console.log("Mensagem semanal enviada!");
-    await delay(2000);
-
-    const fileBuffer = fs.readFileSync(arquivo.filePath);
-    const base64File = fileBuffer.toString("base64");
-    const media = new MessageMedia(
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      base64File,
-      arquivo.fileName
-    );
-
-    await client.sendMessage(numeroFormatado, media);
-    console.log("Arquivo semanal enviado!");
-    await delay(3000);
-  } catch (err) {
-    console.error("Erro ao enviar WhatsApp semanal:", err);
-    console.error("Stack trace:", err.stack);
-    
-    // Notificar erro por e-mail
-    await enviarEmailErro(
-      "Erro ao Enviar WhatsApp - Relatório Semanal",
-      "Ocorreu um erro ao tentar enviar o relatório semanal via WhatsApp. O relatório foi gerado e enviado por e-mail, mas falhou no envio via WhatsApp.",
-      err,
-      {
-        periodo: `${dataInicio} até ${dataFim}`,
-        tipo: "Relatório Semanal"
-      }
-    );
-  } finally {
-    if (whatsappClient) {
-      try {
-        await delay(5000);
-        await whatsappClient.destroy();
-        whatsappClient = null;
-      } catch (destroyErr) {
-        console.warn("Erro ao desconectar cliente WhatsApp:", destroyErr.message);
-      }
+  await enviarWebhookResumo(
+    "Semanal",
+    {
+      dataReferencia: {
+        inicio: dataInicio,
+        fim: dataFim,
+      },
+      nome_da_data_de_referencia: "",
+      quantidadeTransmissoes: transmissoes.length,
+      quantidadeEmissoes: apolices.length,
+      quantidadeSinistrosAbertos: sinistros.length,
+      quantidadeAssistenciasUrgentes: assistencias.length,
+      numeroWhatsApp,
+    },
+    {
+      tipo: "Relatório Semanal",
+      periodo: `${dataInicio} até ${dataFim}`,
     }
-  }
+  );
 }
 
-async function enviarWhatsAppMensal(transmissoes, apolices, sinistros, assistencias, arquivo, mesNome) {
-  try {
-    const numeroDestinatario = process.env.DIRETOR_WHATSAPP;
-    if (!numeroDestinatario) return;
+async function enviarWebhookMensal(
+  transmissoes,
+  apolices,
+  sinistros,
+  assistencias,
+  inicio,
+  fim,
+  mesNome
+) {
+  const numeroWhatsApp = obterNumeroWhatsApp();
 
-    const client = await inicializarWhatsApp();
-    await delay(3000);
-
-    let numeroFormatado = numeroDestinatario.replace(/\D/g, "");
-    if (!numeroFormatado.startsWith("55")) numeroFormatado = "55" + numeroFormatado;
-    numeroFormatado = numeroFormatado + "@c.us";
-
-    const mensagem = `📊 *Relatório Mensal - Centro de Operações*
-
-📅 *Período:* ${mesNome}
-
-📈 *Resumo do Mês:*
-• Transmissões: *${transmissoes.length}*
-• Apólices Emitidas: *${apolices.length}*
-• Sinistros Abertos: *${sinistros.length}*
-• Assistências Urgentes: *${assistencias.length}*
-
-📎 Planilha completa em anexo.`.trim();
-
-    await client.sendMessage(numeroFormatado, mensagem);
-    console.log("Mensagem mensal enviada!");
-    await delay(2000);
-
-    const fileBuffer = fs.readFileSync(arquivo.filePath);
-    const base64File = fileBuffer.toString("base64");
-    const media = new MessageMedia(
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      base64File,
-      arquivo.fileName
-    );
-
-    await client.sendMessage(numeroFormatado, media);
-    console.log("Arquivo mensal enviado!");
-    await delay(3000);
-  } catch (err) {
-    console.error("Erro ao enviar WhatsApp mensal:", err);
-    console.error("Stack trace:", err.stack);
-    
-    // Notificar erro por e-mail
-    await enviarEmailErro(
-      "Erro ao Enviar WhatsApp - Relatório Mensal",
-      "Ocorreu um erro ao tentar enviar o relatório mensal via WhatsApp. O relatório foi gerado e enviado por e-mail, mas falhou no envio via WhatsApp.",
-      err,
-      {
-        periodo: mesNome,
-        tipo: "Relatório Mensal"
-      }
-    );
-  } finally {
-    if (whatsappClient) {
-      try {
-        await delay(5000);
-        await whatsappClient.destroy();
-        whatsappClient = null;
-      } catch (destroyErr) {
-        console.warn("Erro ao desconectar cliente WhatsApp:", destroyErr.message);
-      }
+  await enviarWebhookResumo(
+    "Mensal",
+    {
+      dataReferencia: {
+        inicio,
+        fim,
+        descricao: mesNome,
+      },
+      nome_da_data_de_referencia: mesNome || "",
+      quantidadeTransmissoes: transmissoes.length,
+      quantidadeEmissoes: apolices.length,
+      quantidadeSinistrosAbertos: sinistros.length,
+      quantidadeAssistenciasUrgentes: assistencias.length,
+      numeroWhatsApp,
+    },
+    {
+      tipo: "Relatório Mensal",
+      periodo: mesNome,
     }
-  }
+  );
 }
 
 
@@ -2194,7 +1813,6 @@ process.on("unhandledRejection", async (reason, promise) => {
     console.error("❌ Falha ao enviar e-mail de erro crítico:", emailErr);
   }
 });
-
 
 // Agendar execução diária às 6h (terça a sábado - dias úteis)
 console.log("Agendando relatório diário para 6h da manhã (terça a sábado)...");
@@ -2256,8 +1874,8 @@ console.log("Executando relatórios imediatamente (modo teste)...");
 (async () => {
   try {
     await gerarRelatorioDiario(false); // false = não encerra o processo
-    //await gerarRelatorioSemanal(false); // false = não encerra o processo
-    //await gerarRelatorioMensal(false); // false = não encerra o processo
+    await gerarRelatorioSemanal(false); // false = não encerra o processo
+    await gerarRelatorioMensal(false); // false = não encerra o processo
     console.log("\n✅ Todos os relatórios foram executados com sucesso!");
     console.log("Finalizando processo...");
     setTimeout(() => {
