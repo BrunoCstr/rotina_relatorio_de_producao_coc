@@ -12,22 +12,10 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function formatarNumeroWhatsApp(numero) {
-  if (!numero) return null;
-  const digits = numero.replace(/\D/g, "");
-  if (!digits) return null;
-  return digits.startsWith("55") ? digits : `55${digits}`;
-}
-
-function obterNumeroWhatsApp() {
-  const numeroEnv = process.env.DIRETOR_WHATSAPP || null;
-  if (!numeroEnv) {
-    return { original: null, formatado: null };
-  }
-  return {
-    original: numeroEnv,
-    formatado: formatarNumeroWhatsApp(numeroEnv),
-  };
+function obterContatoDiretor() {
+  const telefone = process.env.DIRETOR_TELEFONE || null;
+  const nome = process.env.DIRETOR_NOME || null;
+  return { telefone, nome };
 }
 
 /**
@@ -1092,6 +1080,11 @@ async function enviarWebhookResumo(tipo, payload, contextoErro = {}) {
       (_, value) => (typeof value === "bigint" ? value.toString() : value)
     );
 
+    console.log(
+      `Enviando webhook (${tipo}) para ${webhookUrl} com payload:`,
+      body
+    );
+
     const response = await fetch(webhookUrl, {
       method: "POST",
       headers: {
@@ -1128,7 +1121,7 @@ async function enviarWebhookDiario(
   assistenciasUrgentes,
   dataAnterior
 ) {
-  const numeroWhatsApp = obterNumeroWhatsApp();
+  const { telefone: numeroWhatsApp, nome: nomeDiretor } = obterContatoDiretor();
 
   await enviarWebhookResumo(
     "Diário",
@@ -1137,15 +1130,16 @@ async function enviarWebhookDiario(
         inicio: dataAnterior,
         fim: dataAnterior,
       },
-      nome_da_data_de_referencia: "",
+      nome_da_data_de_referencia: null,
       quantidadeTransmissoes: transmissoes.length,
       quantidadeEmissoes: apolicesEmitidas.length,
       quantidadeSinistrosAbertos: sinistros.length,
       quantidadeAssistenciasUrgentes: assistenciasUrgentes.length,
       numeroWhatsApp,
+      nomeDiretor,
     },
     {
-      tipo: "Relatório Diário",
+      tipo: "Diário",
       data: dataAnterior,
     }
   );
@@ -1708,7 +1702,7 @@ async function enviarWebhookSemanal(
   dataInicio,
   dataFim
 ) {
-  const numeroWhatsApp = obterNumeroWhatsApp();
+  const { telefone: numeroWhatsApp, nome: nomeDiretor } = obterContatoDiretor();
 
   await enviarWebhookResumo(
     "Semanal",
@@ -1717,12 +1711,13 @@ async function enviarWebhookSemanal(
         inicio: dataInicio,
         fim: dataFim,
       },
-      nome_da_data_de_referencia: "",
+      nome_da_data_de_referencia: null,
       quantidadeTransmissoes: transmissoes.length,
       quantidadeEmissoes: apolices.length,
       quantidadeSinistrosAbertos: sinistros.length,
       quantidadeAssistenciasUrgentes: assistencias.length,
       numeroWhatsApp,
+      nomeDiretor,
     },
     {
       tipo: "Relatório Semanal",
@@ -1740,7 +1735,7 @@ async function enviarWebhookMensal(
   fim,
   mesNome
 ) {
-  const numeroWhatsApp = obterNumeroWhatsApp();
+  const { telefone: numeroWhatsApp, nome: nomeDiretor } = obterContatoDiretor();
 
   await enviarWebhookResumo(
     "Mensal",
@@ -1750,12 +1745,13 @@ async function enviarWebhookMensal(
         fim,
         descricao: mesNome,
       },
-      nome_da_data_de_referencia: mesNome || "",
+      nome_da_data_de_referencia: mesNome || "Mês anterior",
       quantidadeTransmissoes: transmissoes.length,
       quantidadeEmissoes: apolices.length,
       quantidadeSinistrosAbertos: sinistros.length,
       quantidadeAssistenciasUrgentes: assistencias.length,
       numeroWhatsApp,
+      nomeDiretor,
     },
     {
       tipo: "Relatório Mensal",
@@ -1813,6 +1809,7 @@ process.on("unhandledRejection", async (reason, promise) => {
     console.error("❌ Falha ao enviar e-mail de erro crítico:", emailErr);
   }
 });
+
 
 // Agendar execução diária às 6h (terça a sábado - dias úteis)
 console.log("Agendando relatório diário para 6h da manhã (terça a sábado)...");
@@ -1874,8 +1871,8 @@ console.log("Executando relatórios imediatamente (modo teste)...");
 (async () => {
   try {
     await gerarRelatorioDiario(false); // false = não encerra o processo
-    await gerarRelatorioSemanal(false); // false = não encerra o processo
-    await gerarRelatorioMensal(false); // false = não encerra o processo
+    //await gerarRelatorioSemanal(false); // false = não encerra o processo
+    //await gerarRelatorioMensal(false); // false = não encerra o processo
     console.log("\n✅ Todos os relatórios foram executados com sucesso!");
     console.log("Finalizando processo...");
     setTimeout(() => {
